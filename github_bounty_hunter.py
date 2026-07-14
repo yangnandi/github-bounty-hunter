@@ -1,21 +1,21 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-GitHub Bounty Hunter --- zi dong sou xun GitHub shang jin Issue bing ti jiao xiu fu PR de zi dong hua gong ju.
+GitHub Bounty Hunter --- 自动搜寻 GitHub 上有赏金 Issue 并提交修复 PR 的自动化工具。
 
-yong fa:
-    python github_bounty_hunter.py                  # wan zheng yun xing
-    python github_bounty_hunter.py --dry-run        # jin sou suo fen xi sheng cheng, bu ti jiao PR
-    python github_bounty_hunter.py --limit 5         # zui duo chu li 5 ge issue
-    python github_bounty_hunter.py --issue <url>     # dan ge issue
+用法:
+    python github_bounty_hunter.py                  # 完整运行
+    python github_bounty_hunter.py --dry-run        # 仅搜索分析生成, 不提交 PR
+    python github_bounty_hunter.py --limit 5         # 最多处理 5 个 issue
+    python github_bounty_hunter.py --issue <url>     # 单个 issue
 
-huan jing bian liang:
-    GITHUB_TOKEN      GitHub Personal Access Token (bi xu)
-    OPENAI_API_KEY    OpenAI API Key (bi xu)
+环境变量:
+    GITHUB_TOKEN      GitHub Personal Access Token (必须)
+    OPENAI_API_KEY    OpenAI API Key (必须)
 
-feng xian jing gao:
-    zi dong hua ti jiao PR ke neng bei cang ku wei hu zhe shi wei la ji xin xi. qiang lie jian yi chu qi shi yong --dry-run
-    mo shi, ren gong shen he sheng cheng de xiu fu dai ma hou zai shou dong ti jiao. qing zai zun shou GitHub fu wu tiao kuan he
-    ge cang ku xing wei zhun ze de qian ti xia shi yong ben gong ju.
+风险警告:
+    自动化提交 PR 可能被仓库维护者视为垃圾信息。强烈建议初期使用 --dry-run
+    模式, 人工审核生成的修复代码后再手动提交。请在遵守 GitHub 服务条款和
+    各仓库行为准则的前提下使用本工具。
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ BOUNTY_CURRENCY_PATTERNS: List[str] = [
 
 BOUNTY_INDICATOR_WORDS: List[str] = [
     "bounty", "reward", "paid", "payment", "prize", "compensation",
-    "\U0001f4b0", "\U0001f4b5", "\U0001f4b2", "\U0001fa99", "funded", "pays", "payout",
+    "💰", "💵", "💲", "🪙", "funded", "pays", "payout",
 ]
 
 PR_BODY_TEMPLATE = """## Summary
@@ -156,22 +156,26 @@ class GitHubClient:
 
             except requests.RequestException as exc:
                 last_exc = exc
-                log.warning("Network error: %s, retry %d/%d", exc, attempt, max_retries)
-                time.sleep(2 ** attempt)
+                log.warning("Request failed (attempt %d/%d): %s", attempt, max_retries, exc)
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
 
-        raise RuntimeError(f"Request failed after {max_retries} retries: {last_exc}")
+        raise last_exc  # type: ignore[misc]
 
-    def get(self, url: str) -> requests.Response:
-        return self._request("GET", url)
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._request("GET", url, **kwargs)
 
-    def post(self, url: str, body: Dict[str, Any]) -> requests.Response:
-        return self._request("POST", url, json_body=body)
+    def post(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._request("POST", url, **kwargs)
 
-    def patch(self, url: str, body: Dict[str, Any]) -> requests.Response:
-        return self._request("PATCH", url, json_body=body)
+    def patch(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._request("PATCH", url, **kwargs)
 
-    def put(self, url: str, body: Optional[Dict[str, Any]] = None) -> requests.Response:
-        return self._request("PUT", url, json_body=body)
+    def put(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._request("PUT", url, **kwargs)
+
+    def delete(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._request("DELETE", url, **kwargs)
 
     @property
     def user_login(self) -> str:
@@ -182,304 +186,266 @@ class GitHubClient:
         return self._user_login
 
 
-def search_bounty_issues(
-    gh: GitHubClient,
-    limit: int = 20,
-    extra_query: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Search for bounty issues using the GitHub Search API."""
-    found: Dict[int, Dict[str, Any]] = {}
-
-    queries = list(BOUNTY_SEARCH_QUERIES)
-    if extra_query:
-        queries.append(extra_query)
-
-    for query in queries:
-        if len(found) >= limit:
-            break
-        log.info("Searching: %s", query)
-        try:
-            resp = gh.get(
-                f"{GITHUB_API_BASE}/search/issues?q={query}&per_page=30&sort=created&order=desc"
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            for item in data.get("items", []):
-                found[item["id"]] = item
-            log.info("  Found %d candidates (total %d)", len(data.get("items", [])), len(found))
-        except Exception as exc:
-            log.error("Search failed (%s): %s", query, exc)
-        time.sleep(random.uniform(1.0, 3.0))
-
-    issues = list(found.values())[:limit]
-    log.info("Total %d candidate issues", len(issues))
-    return issues
-
-
-def extract_bounty_info(text: str) -> Dict[str, Any]:
-    """Extract bounty amount and currency from issue text."""
-    matches = []
-    for pattern in BOUNTY_CURRENCY_PATTERNS:
-        for m in re.finditer(pattern, text, re.IGNORECASE):
-            matches.append(m.group(0).strip())
-
-    amount = None
-    currency = None
-    if matches:
-        first = matches[0]
-        amt_match = re.search(r"\d[\d,]*(?:\.\d+)?", first)
-        if amt_match:
-            amount = amt_match.group(0).replace(",", "")
-        if "$" in first:
-            currency = "USD"
-        elif "ETH" in first.upper():
-            currency = "ETH"
-        elif "USDC" in first.upper():
-            currency = "USDC"
-        elif "USDT" in first.upper():
-            currency = "USDT"
-        else:
-            currency = "unknown"
-
-    return {"amount": amount, "currency": currency, "raw_matches": matches}
-
-
-def is_likely_bounty_issue(issue: Dict[str, Any]) -> Tuple[bool, str]:
-    """Determine if an issue likely contains a bounty."""
-    title = (issue.get("title") or "").lower()
-    body = (issue.get("body") or "").lower()
-    combined = f"{title}\n{body}"
-
-    labels = [lbl["name"].lower() for lbl in issue.get("labels", [])]
-    for label in labels:
-        if any(w in label for w in ("bounty", "paid", "reward", "prize")):
-            return True, f"label \"{label}\""
-
-    if "pull_request" in issue:
-        return False, "is a pull request, not an issue"
-
-    for word in BOUNTY_INDICATOR_WORDS:
-        if word.lower() in combined:
-            return True, f"contains \"{word}\""
-
-    for pattern in BOUNTY_CURRENCY_PATTERNS:
-        if re.search(pattern, combined, re.IGNORECASE):
-            return True, "amount pattern matched"
-
-    return False, "no bounty indicators"
-
-
-def filter_bounty_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Filter issues to those likely containing bounties."""
-    result = []
-    for issue in issues:
-        is_bounty, reason = is_likely_bounty_issue(issue)
-        if is_bounty:
-            body = issue.get("body") or ""
-            title = issue.get("title") or ""
-            issue["bounty_info"] = extract_bounty_info(f"{title}\n{body}")
-            issue["bounty_reason"] = reason
-            result.append(issue)
-            log.info("  OK #%d (%s) --- %s", issue["number"], str(issue.get("title", ""))[:60], reason)
-        else:
-            log.debug("  SKIP #%d --- %s", issue["number"], reason)
-    log.info("After filtering: %d bounty issues", len(result))
-    return result
-
-
-def get_issue_detail(gh: GitHubClient, issue_url: str) -> Dict[str, Any]:
-    """Get full issue details."""
-    resp = gh.get(issue_url)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_repo_file_tree(
-    gh: GitHubClient, owner: str, repo: str, branch: str = "main"
-) -> Optional[List[Dict[str, Any]]]:
-    """Get the repository root file tree (first level only)."""
-    try:
-        resp = gh.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{branch}?recursive=0"
-        )
-        resp.raise_for_status()
-        return resp.json().get("tree", [])
-    except Exception as exc:
-        log.warning("Failed to get file tree (%s/%s): %s", owner, repo, exc)
-        return None
-
-
-def get_file_content(
-    gh: GitHubClient, owner: str, repo: str, path: str, ref: str = "main"
-) -> Optional[str]:
-    """Get the content of a single file from a repository."""
-    try:
-        resp = gh.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-    except Exception as exc:
-        log.debug("Failed to get file content (%s): %s", path, exc)
-        return None
-
-
-def extract_repo_info(issue: Dict[str, Any]) -> Tuple[str, str, int, str]:
-    """Extract owner, repo, issue_number, repo_full_name from issue data."""
-    url = issue.get("repository_url", "") or issue.get("url", "")
-    parts = url.rstrip("/").split("/")
-    owner = parts[-2] if len(parts) >= 2 else ""
-    repo = parts[-1] if len(parts) >= 1 else ""
-    number = issue.get("number", 0)
-    full_name = f"{owner}/{repo}"
-    return owner, repo, number, full_name
-
-
 class CodexClient:
-    """Encapsulates OpenAI API calls for code generation."""
+    """Encapsulates OpenAI API operations for code generation."""
 
     def __init__(self, api_key: str, model: str = "gpt-4o") -> None:
         self.client = OpenAI(api_key=api_key)
         self.model = model
 
     def analyze_issue(
-        self,
-        issue_title: str,
-        issue_body: str,
-        file_tree: Optional[List[Dict[str, Any]]] = None,
-    ) -> str:
-        """Analyze an issue and return a summary with fix suggestions."""
-        tree_desc = ""
-        if file_tree:
-            tree_paths = [
-                f["path"] for f in file_tree[:30] if f.get("type") != "tree"
-            ]
-            tree_desc = "\n".join(f"  - {p}" for p in tree_paths)
+        self, title: str, body: str, repo_full_name: str
+    ) -> Dict[str, Any]:
+        """Analyze a GitHub issue and return structured analysis."""
+        prompt = f"""You are an expert software developer. Analyze the following GitHub issue
+from repository {repo_full_name} and provide a structured response.
 
-        prompt = f"""You are an expert software engineer. Analyze the following GitHub issue and provide:
-1. A concise summary of the problem.
-2. Root cause analysis.
-3. A detailed fix plan.
-4. Which files likely need changes.
+Issue Title: {title}
 
-## Issue Title
-{issue_title}
+Issue Body:
+{body[:6000]}
 
-## Issue Body
-{issue_body}
-
-## Repository Files (top-level)
-{tree_desc or "(not available)"}
-
-Respond in a structured format."""
-
+Provide your analysis in the following JSON structure:
+{{
+    "summary": "Brief summary of the issue",
+    "bounty_confirmed": true/false,
+    "estimated_bounty": "amount if confirmed, otherwise null",
+    "difficulty": "easy/medium/hard",
+    "involved_files": ["list of likely files to modify"],
+    "root_cause": "Root cause analysis",
+    "suggested_fix": "Detailed description of the fix approach"
+}}
+"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are an expert software developer. Always respond in valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        content = response.choices[0].message.content or "{}"
+        # Try to extract JSON from the response
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert software engineer helping to fix GitHub issues. Be thorough and precise."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                max_tokens=1500,
-            )
-            return response.choices[0].message.content or ""
-        except Exception as exc:
-            log.error("OpenAI analysis failed: %s", exc)
-            return f"[Analysis failed: {exc}]"
+            return json.loads(content)
+        except json.JSONDecodeError:
+            # Try to find JSON in markdown code blocks
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    pass
+            log.warning("Failed to parse analysis JSON, returning raw content")
+            return {"raw_analysis": content}
 
     def generate_fix(
         self,
         issue_title: str,
         issue_body: str,
-        analysis: str,
-        relevant_files: Optional[Dict[str, str]] = None,
+        analysis: Dict[str, Any],
+        repo_full_name: str,
     ) -> Dict[str, Any]:
-        """Generate code fix based on issue and context."""
-        files_section = ""
-        if relevant_files:
-            files_section = "## Current File Contents\n\n"
-            for path, content in relevant_files.items():
-                truncated = content[:4000]
-                files_section += f"### {path}\n```\n{truncated}\n```\n\n"
+        """Generate code fix based on issue analysis."""
+        prompt = f"""You are an expert software developer. Generate a code fix for the following
+GitHub issue from repository {repo_full_name}.
 
-        prompt = f"""You are an expert software engineer. Based on the issue and analysis below,
-generate the exact code changes needed to fix the problem.
+Issue Title: {issue_title}
 
-## Issue
-Title: {issue_title}
-Body: {issue_body[:3000]}
+Issue Body:
+{issue_body[:4000]}
 
-## Analysis
-{analysis[:2000]}
+Analysis:
+{json.dumps(analysis, indent=2)}
 
-{files_section}
-
-## Instructions
-Output a JSON object with this exact structure:
+Provide your fix in the following JSON structure:
 {{
-  "description": "Brief summary of changes made",
-  "files": [
-    {{"path": "relative/path/to/file", "content": "full updated file content"}}
-  ]
+    "files_to_modify": [
+        {{
+            "path": "relative/path/to/file",
+            "description": "What needs to change in this file",
+            "patch": "The actual code changes to make"
+        }}
+    ],
+    "files_to_create": [
+        {{
+            "path": "relative/path/to/new/file",
+            "content": "Full file content"
+        }}
+    ],
+    "commit_message": "Concise commit message",
+    "changes_summary": "Summary of changes made"
 }}
+"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are an expert software developer. Always respond in valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=4000,
+        )
+        content = response.choices[0].message.content or "{}"
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    pass
+            log.warning("Failed to parse fix JSON, returning raw content")
+            return {"raw_fix": content}
 
-Provide the COMPLETE updated file content for each modified file.
-Only include files that actually need changes.
-Ensure the JSON is valid."""
+
+def search_bounty_issues(
+    gh: GitHubClient,
+    limit: int = 15,
+    extra_query: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Search GitHub for issues that may have bounties."""
+    all_issues: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for query in BOUNTY_SEARCH_QUERIES:
+        if len(all_issues) >= limit * 2:
+            break
+
+        full_query = f"{query}+archived:false+is:issue"
+        if extra_query:
+            full_query += f"+{extra_query}"
+
+        url = f"{GITHUB_API_BASE}/search/issues?q={full_query}&sort=created&order=desc&per_page=min(limit,10)"
+        # Replace per_page parameter
+        url = f"{GITHUB_API_BASE}/search/issues?q={full_query}&sort=created&order=desc&per_page=10"
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert software engineer. Output valid JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=4000,
-                response_format={"type": "json_object"},
-            )
-            result_text = response.choices[0].message.content or "{}"
-            result_text = re.sub(r"^```(?:json)?\s*", "", result_text.strip())
-            result_text = re.sub(r"\s*```$", "", result_text.strip())
-            return json.loads(result_text)
-        except json.JSONDecodeError as exc:
-            log.error("Failed to parse OpenAI JSON response: %s", exc)
-            return {"description": "Failed to parse", "files": []}
+            resp = gh.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+            for item in data.get("items", []):
+                issue_id = item["id"]
+                if issue_id in seen:
+                    continue
+                seen.add(issue_id)
+
+                # Skip pull requests (they appear in issue search too)
+                if "pull_request" in item:
+                    continue
+
+                all_issues.append(item)
+
+                if len(all_issues) >= limit * 2:
+                    break
+
         except Exception as exc:
-            log.error("OpenAI fix generation failed: %s", exc)
-            return {"description": f"Generation failed: {exc}", "files": []}
+            log.error("Search query '%s' failed: %s", query, exc)
+            continue
+
+        delay = random.uniform(1.0, 3.0)
+        time.sleep(delay)
+
+    log.info("Found %d candidate issues", len(all_issues))
+    return all_issues
 
 
-def check_existing_prs(
-    gh: GitHubClient, owner: str, repo: str, issue_number: int, author_login: str
-) -> bool:
-    """Check if a PR from the same author already exists for this issue."""
-    try:
-        resp = gh.get(
-            f"{GITHUB_API_BASE}/search/issues"
-            f"?q=type:pr+repo:{owner}/{repo}+{issue_number}+state:open"
+def extract_bounty_info(text: str) -> Dict[str, Any]:
+    """Extract bounty information from issue text."""
+    if not text:
+        return {"has_bounty": False, "amount": None, "currency": None, "mentions": []}
+
+    text_lower = text.lower()
+    mentions = [w for w in BOUNTY_INDICATOR_WORDS if w in text_lower or w in text]
+
+    amounts = []
+    for pattern in BOUNTY_CURRENCY_PATTERNS:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for m in matches:
+            # Extract numeric value
+            num_match = re.search(r"\d[\d,]*", m)
+            if num_match:
+                num_str = num_match.group().replace(",", "")
+                try:
+                    amount = float(num_str)
+                    currency = "USD"
+                    if "ETH" in m.upper():
+                        currency = "ETH"
+                    elif "USDC" in m.upper():
+                        currency = "USDC"
+                    elif "USDT" in m.upper():
+                        currency = "USDT"
+                    elif "$" in m:
+                        currency = "USD"
+                    amounts.append((amount, currency, m.strip()))
+                except ValueError:
+                    pass
+
+    has_bounty = bool(mentions) or bool(amounts)
+    max_amount = None
+    max_currency = None
+    if amounts:
+        amounts.sort(key=lambda x: x[0], reverse=True)
+        max_amount, max_currency, _ = amounts[0]
+
+    return {
+        "has_bounty": has_bounty,
+        "amount": max_amount,
+        "currency": max_currency,
+        "mentions": mentions,
+        "all_amounts": amounts,
+    }
+
+
+def filter_bounty_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter issues to those likely having bounties."""
+    filtered = []
+
+    for issue in issues:
+        title = issue.get("title", "")
+        body = issue.get("body", "") or ""
+        labels = [lbl.get("name", "").lower() for lbl in issue.get("labels", [])]
+
+        combined_text = f"{title}\n{body}"
+        bounty_info = extract_bounty_info(combined_text)
+
+        # Check labels for bounty indicators
+        label_has_bounty = any(
+            any(w in label for w in ["bounty", "reward", "paid", "payment", "prize"])
+            for label in labels
         )
+
+        if bounty_info["has_bounty"] or label_has_bounty:
+            issue["bounty_info"] = bounty_info
+            filtered.append(issue)
+
+    log.info("Filtered to %d issues with bounty indicators", len(filtered))
+    return filtered
+
+
+def check_duplicate_pr(
+    gh: GitHubClient, owner: str, repo: str, issue_number: int
+) -> bool:
+    """Check if a PR already exists for the given issue."""
+    try:
+        url = f"{GITHUB_API_BASE}/search/issues?q=is:pr+repo:{owner}/{repo}+Fixes #{issue_number}"
+        resp = gh.get(url)
         resp.raise_for_status()
         data = resp.json()
-        for item in data.get("items", []):
-            pr_user = item.get("user", {}).get("login", "")
-            if pr_user == author_login:
-                log.warning(
-                    "Existing PR #%d by %s already references issue #%d",
-                    item["number"], author_login, issue_number,
-                )
-                return True
+        return data.get("total_count", 0) > 0
     except Exception as exc:
-        log.warning("Failed to check existing PRs: %s", exc)
-    return False
+        log.warning("Failed to check duplicate PRs: %s", exc)
+        return False
 
 
-def fork_repository(gh: GitHubClient, owner: str, repo: str) -> Optional[str]:
-    """Fork a repository and return the fork full_name."""
+def fork_repository(gh: GitHubClient, owner: str, repo: str) -> str:
+    """Fork the repository and return the fork's full name."""
+    # Check if already forked
+    user = gh.user_login
     try:
-        user = gh.user_login
         resp = gh.get(f"{GITHUB_API_BASE}/repos/{user}/{repo}")
         if resp.status_code == 200:
             log.info("Fork already exists: %s/%s", user, repo)
@@ -487,170 +453,186 @@ def fork_repository(gh: GitHubClient, owner: str, repo: str) -> Optional[str]:
     except Exception:
         pass
 
-    try:
-        resp = gh.post(f"{GITHUB_API_BASE}/repos/{owner}/{repo}/forks", {})
-        resp.raise_for_status()
-        data = resp.json()
-        forked = data["full_name"]
-        log.info("Forked repository: %s", forked)
-        time.sleep(3)
-        return forked
-    except Exception as exc:
-        log.error("Failed to fork repository (%s/%s): %s", owner, repo, exc)
-        return None
+    log.info("Forking %s/%s...", owner, repo)
+    resp = gh.post(f"{GITHUB_API_BASE}/repos/{owner}/{repo}/forks")
+    resp.raise_for_status()
+
+    # Wait for fork to be ready
+    for _ in range(30):
+        try:
+            fork_resp = gh.get(f"{GITHUB_API_BASE}/repos/{user}/{repo}")
+            if fork_resp.status_code == 200:
+                log.info("Fork ready: %s/%s", user, repo)
+                return f"{user}/{repo}"
+        except Exception:
+            pass
+        time.sleep(2)
+
+    raise RuntimeError(f"Fork of {owner}/{repo} did not become ready in time")
 
 
-def get_default_branch(gh: GitHubClient, owner: str, repo: str) -> str:
-    """Get the default branch of a repository."""
-    try:
-        resp = gh.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo}")
-        resp.raise_for_status()
-        return resp.json().get("default_branch", "main")
-    except Exception:
-        return "main"
-
-
-def get_latest_commit_sha(
-    gh: GitHubClient, owner: str, repo: str, branch: str
-) -> Optional[str]:
-    """Get the latest commit SHA for a branch."""
-    try:
-        resp = gh.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}"
-        )
-        resp.raise_for_status()
-        return resp.json()["object"]["sha"]
-    except Exception as exc:
-        log.error("Failed to get branch SHA: %s", exc)
-        return None
-
-
-def create_branch(
-    gh: GitHubClient, owner: str, repo: str, branch_name: str, base_sha: str
-) -> bool:
-    """Create a new branch in the fork repository."""
-    try:
-        resp = gh.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs",
-            {"ref": f"refs/heads/{branch_name}", "sha": base_sha},
-        )
-        if resp.status_code == 422:
-            log.info("Branch %s already exists", branch_name)
-            return True
-        resp.raise_for_status()
-        log.info("Created branch: %s", branch_name)
-        return True
-    except Exception as exc:
-        log.error("Failed to create branch: %s", exc)
-        return False
-
-
-def create_blob(gh: GitHubClient, owner: str, repo: str, content: str) -> Optional[str]:
-    """Create a Git blob and return its SHA."""
-    try:
-        resp = gh.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/blobs",
-            {"content": content, "encoding": "utf-8"},
-        )
-        resp.raise_for_status()
-        return resp.json()["sha"]
-    except Exception as exc:
-        log.error("Failed to create blob: %s", exc)
-        return None
-
-
-def create_tree(
+def create_fix_branch(
     gh: GitHubClient,
-    owner: str,
-    repo: str,
-    base_tree_sha: str,
-    files: List[Dict[str, str]],
-) -> Optional[str]:
-    """Create a Git tree and return its SHA."""
-    tree_items = []
-    for f in files:
-        blob_sha = create_blob(gh, owner, repo, f["content"])
-        if not blob_sha:
-            return None
-        tree_items.append({
-            "path": f["path"],
-            "mode": "100644",
-            "type": "blob",
-            "sha": blob_sha,
-        })
+    fork_full_name: str,
+    issue_number: int,
+    base_branch: str = "main",
+) -> str:
+    """Create a new branch for the fix in the forked repository."""
+    branch_name = f"bounty-fix-issue-{issue_number}-{int(time.time())}"
 
-    try:
-        resp = gh.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees",
-            {"base_tree": base_tree_sha, "tree": tree_items},
-        )
-        resp.raise_for_status()
-        return resp.json()["sha"]
-    except Exception as exc:
-        log.error("Failed to create tree: %s", exc)
-        return None
+    # Get the base branch SHA
+    owner, repo = fork_full_name.split("/")
+    resp = gh.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{base_branch}")
+    resp.raise_for_status()
+    base_sha = resp.json()["object"]["sha"]
+
+    # Create new branch
+    gh.post(
+        f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs",
+        json_body={"ref": f"refs/heads/{branch_name}", "sha": base_sha},
+    )
+
+    log.info("Created branch: %s", branch_name)
+    return branch_name
 
 
-def create_commit(
+def apply_fix_to_branch(
     gh: GitHubClient,
-    owner: str,
-    repo: str,
-    message: str,
-    tree_sha: str,
-    parent_sha: str,
-) -> Optional[str]:
-    """Create a Git commit and return its SHA."""
-    try:
-        resp = gh.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits",
-            {"message": message, "tree": tree_sha, "parents": [parent_sha]},
+    fork_full_name: str,
+    branch_name: str,
+    fix_result: Dict[str, Any],
+) -> List[str]:
+    """Apply code changes to the branch. Returns list of modified file paths."""
+    owner, repo = fork_full_name.split("/")
+    modified_files = []
+
+    for file_info in fix_result.get("files_to_modify", []):
+        path = file_info["path"]
+        patch_content = file_info.get("patch", "")
+
+        if not patch_content:
+            continue
+
+        # Get current file content
+        try:
+            resp = gh.get(
+                f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}",
+                json_body={"ref": branch_name},
+            )
+            resp.raise_for_status()
+            current_file = resp.json()
+            current_sha = current_file["sha"]
+            current_content = base64.b64decode(current_file["content"]).decode("utf-8")
+        except Exception:
+            log.warning("Could not read %s, skipping", path)
+            continue
+
+        # Simple patch application (replace the entire file with AI-generated content)
+        # In production, you'd want proper diff application
+        new_content = patch_content if patch_content else current_content
+
+        gh.put(
+            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}",
+            json_body={
+                "message": f"Fix #{fix_result.get('issue_number', '?')}: {file_info.get('description', 'Update')}",
+                "content": base64.b64encode(new_content.encode("utf-8")).decode("utf-8"),
+                "sha": current_sha,
+                "branch": branch_name,
+            },
         )
-        resp.raise_for_status()
-        return resp.json()["sha"]
-    except Exception as exc:
-        log.error("Failed to create commit: %s", exc)
-        return None
+        modified_files.append(path)
+        log.info("Updated: %s", path)
 
+    for file_info in fix_result.get("files_to_create", []):
+        path = file_info["path"]
+        content = file_info.get("content", "")
 
-def update_branch_ref(
-    gh: GitHubClient, owner: str, repo: str, branch: str, sha: str
-) -> bool:
-    """Update a branch reference to point to a new commit."""
-    try:
-        resp = gh.patch(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
-            {"sha": sha, "force": False},
+        if not content:
+            continue
+
+        gh.put(
+            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}",
+            json_body={
+                "message": f"Add {path}",
+                "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+                "branch": branch_name,
+            },
         )
-        resp.raise_for_status()
-        log.info("Branch %s updated to %s", branch, sha[:8])
-        return True
-    except Exception as exc:
-        log.error("Failed to update branch ref: %s", exc)
-        return False
+        modified_files.append(path)
+        log.info("Created: %s", path)
+
+    return modified_files
 
 
-def create_pull_request(
+def create_fix_pr(
     gh: GitHubClient,
-    owner: str,
-    repo: str,
-    head: str,
-    base: str,
-    title: str,
-    body: str,
+    fork_full_name: str,
+    upstream_owner: str,
+    upstream_repo: str,
+    branch_name: str,
+    issue: Dict[str, Any],
+    fix_result: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Create a Pull Request."""
-    try:
-        resp = gh.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls",
-            {"title": title, "body": body, "head": head, "base": base},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        log.info("Created PR: %s", data.get("html_url", "N/A"))
-        return data
-    except Exception as exc:
-        log.error("Failed to create PR: %s", exc)
-        return None
+    """Create a Pull Request from the fork branch to upstream."""
+    fork_owner, _ = fork_full_name.split("/")
+    issue_number = issue["number"]
+    issue_title = issue["title"]
+
+    title = f"Fix #{issue_number}: {issue_title[:80]}"
+    body = PR_BODY_TEMPLATE.format(
+        issue_number=issue_number,
+        issue_title=issue_title,
+        changes_summary=fix_result.get("changes_summary", "See commit details."),
+    )
+
+    resp = gh.post(
+        f"{GITHUB_API_BASE}/repos/{upstream_owner}/{upstream_repo}/pulls",
+        json_body={
+            "title": title,
+            "body": body,
+            "head": f"{fork_owner}:{branch_name}",
+            "base": "main",
+        },
+    )
+    resp.raise_for_status()
+    pr_data = resp.json()
+    log.info("PR created: %s", pr_data.get("html_url", ""))
+    return pr_data
+
+
+def save_output(
+    issue: Dict[str, Any],
+    analysis: Dict[str, Any],
+    fix_result: Dict[str, Any],
+    dry_run: bool,
+) -> str:
+    """Save analysis and fix output to disk."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    full_name = issue.get("repository_url", "").split("/repos/")[-1] if issue.get("repository_url") else "unknown"
+    issue_number = issue.get("number", "unknown")
+    filename = f"issue_{full_name.replace('/', '_')}_{issue_number}_{timestamp}.json"
+    output_file = os.path.join(OUTPUT_DIR, filename)
+
+    output_data = {
+        "issue": {
+            "number": issue_number,
+            "title": issue.get("title", ""),
+            "url": issue.get("html_url", ""),
+            "repository": full_name,
+        },
+        "bounty_info": issue.get("bounty_info", {}),
+        "analysis": analysis,
+        "fix": fix_result,
+        "timestamp": timestamp,
+        "dry_run": dry_run,
+    }
+
+    with open(output_file, "w", encoding="utf-8") as fp:
+        json.dump(output_data, fp, ensure_ascii=False, indent=2)
+    log.info("Analysis saved to: %s", output_file)
+
+    return output_file
 
 
 def submit_fix_pr(
@@ -661,70 +643,35 @@ def submit_fix_pr(
     fix_result: Dict[str, Any],
     dry_run: bool = False,
 ) -> bool:
-    """Complete PR submission flow: fork, branch, commit, create PR."""
+    """Submit a fix PR for an issue. Returns True if successful."""
     issue_number = issue["number"]
-    issue_title = issue["title"]
-    repo_full = f"{owner}/{repo}"
-    user = gh.user_login
 
-    if check_existing_prs(gh, owner, repo, issue_number, user):
-        log.info("Skipping issue #%d, PR already exists from %s", issue_number, user)
+    if check_duplicate_pr(gh, owner, repo, issue_number):
+        log.info("PR already exists for issue #%d, skipping", issue_number)
         return False
 
     if dry_run:
-        log.info("[DRY-RUN] Would create PR for %s issue #%d", repo_full, issue_number)
+        log.info("[DRY-RUN] Would create PR for %s/%s#%d", owner, repo, issue_number)
+        log.info("[DRY-RUN] Changes summary: %s", fix_result.get("changes_summary", "N/A"))
         return True
 
-    forked = fork_repository(gh, owner, repo)
-    if not forked:
+    try:
+        fork_full_name = fork_repository(gh, owner, repo)
+        branch_name = create_fix_branch(gh, fork_full_name, issue_number)
+        modified_files = apply_fix_to_branch(gh, fork_full_name, branch_name, fix_result)
+
+        if not modified_files:
+            log.warning("No files were modified, skipping PR creation")
+            return False
+
+        pr_data = create_fix_pr(
+            gh, fork_full_name, owner, repo, branch_name, issue, fix_result
+        )
+        return pr_data is not None
+
+    except Exception as exc:
+        log.error("Failed to submit PR for %s/%s#%d: %s", owner, repo, issue_number, exc)
         return False
-
-    fork_owner, fork_repo = forked.split("/")
-    default_branch = get_default_branch(gh, owner, repo)
-    log.info("Target default branch: %s", default_branch)
-
-    base_sha = get_latest_commit_sha(gh, fork_owner, fork_repo, default_branch)
-    if not base_sha:
-        log.error("Could not get latest commit on fork")
-        return False
-
-    branch_name = f"fix/issue-{issue_number}-bounty"
-    if not create_branch(gh, fork_owner, fork_repo, branch_name, base_sha):
-        return False
-
-    files = fix_result.get("files", [])
-    if not files:
-        log.warning("No files generated for fix")
-        return False
-
-    tree_sha = create_tree(gh, fork_owner, fork_repo, base_sha, files)
-    if not tree_sha:
-        return False
-
-    commit_message = f"Fix #{issue_number}: {issue_title[:70]}"
-    commit_sha = create_commit(gh, fork_owner, fork_repo, commit_message, tree_sha, base_sha)
-    if not commit_sha:
-        return False
-
-    if not update_branch_ref(gh, fork_owner, fork_repo, branch_name, commit_sha):
-        return False
-
-    pr_body = PR_BODY_TEMPLATE.format(
-        issue_number=issue_number,
-        issue_title=issue_title,
-        changes_summary=fix_result.get("description", "See commit for details."),
-    )
-    pr_title = f"Fix #{issue_number}: {issue_title[:60]}"
-
-    pr = create_pull_request(
-        gh, owner, repo,
-        head=f"{fork_owner}:{branch_name}",
-        base=default_branch,
-        title=pr_title,
-        body=pr_body,
-    )
-
-    return pr is not None
 
 
 def process_single_issue(
@@ -733,59 +680,45 @@ def process_single_issue(
     issue: Dict[str, Any],
     dry_run: bool = False,
 ) -> bool:
-    """Process a single bounty issue: analyze, generate fix, submit PR."""
-    owner, repo, number, full_name = extract_repo_info(issue)
-    log.info("=" * 60)
-    log.info("Processing issue #%d: %s", number, issue.get("title", "N/A"))
-    log.info("Repository: %s", full_name)
+    """Process a single issue: analyze, generate fix, and optionally submit PR."""
+    issue_number = issue["number"]
+    issue_title = issue.get("title", "No title")
+    issue_body = issue.get("body", "") or ""
+    repo_url = issue.get("repository_url", "")
+    full_name = repo_url.split("/repos/")[-1] if repo_url else "unknown/unknown"
+    owner, repo = full_name.split("/") if "/" in full_name else ("unknown", "unknown")
 
-    bounty = issue.get("bounty_info", {})
+    bounty = issue.get("bounty_info", extract_bounty_info(f"{issue_title}\n{issue_body}"))
     if bounty.get("amount"):
-        log.info("Bounty: %s %s", bounty["amount"], bounty.get("currency", "?"))
+        log.info(
+            "Issue #%d: %s (bounty: %s %s)",
+            issue_number, issue_title, bounty["amount"], bounty.get("currency", "USD"),
+        )
+    else:
+        log.info("Issue #%d: %s", issue_number, issue_title)
 
-    issue_url = issue.get("url", "")
-    detail = get_issue_detail(gh, issue_url) if issue_url else issue
-    issue_body = detail.get("body") or ""
-    issue_title = detail.get("title") or ""
+    # Step 1: Analyze
+    log.info("Analyzing issue #%d with OpenAI...", issue_number)
+    analysis = codex.analyze_issue(issue_title, issue_body, full_name)
+    log.info("Analysis complete: difficulty=%s, confirmed=%s",
+             analysis.get("difficulty", "unknown"), analysis.get("bounty_confirmed", False))
 
-    file_tree = get_repo_file_tree(gh, owner, repo)
+    # Step 2: Generate fix
+    log.info("Generating fix for issue #%d...", issue_number)
+    fix_result = codex.generate_fix(issue_title, issue_body, analysis, full_name)
+    fix_result["issue_number"] = issue_number
+    fix_result["issue_title"] = issue_title
 
-    log.info("Analyzing issue...")
-    analysis = codex.analyze_issue(issue_title, issue_body, file_tree)
-    log.info("Analysis:\n%s", analysis[:500])
+    # Step 3: Save output
+    output_file = save_output(issue, analysis, fix_result, dry_run)
 
-    relevant_files: Dict[str, str] = {}
-    if file_tree:
-        source_exts = {".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h"}
-        for f in file_tree[:15]:
-            path = f.get("path", "")
-            if any(path.endswith(ext) for ext in source_exts) and f.get("type") == "blob":
-                content = get_file_content(gh, owner, repo, path)
-                if content and len(content) < 5000:
-                    relevant_files[path] = content
-
-    log.info("Generating fix code...")
-    time.sleep(random.uniform(0.5, 1.5))
-    fix_result = codex.generate_fix(issue_title, issue_body, analysis, relevant_files)
-
-    if not fix_result.get("files"):
-        log.warning("No fix code generated")
-        return False
-
-    log.info("Generated %d file changes:", len(fix_result["files"]))
-    for f in fix_result["files"]:
-        log.info("  - %s (%d chars)", f["path"], len(f.get("content", "")))
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # Build output data for saving
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(
-        OUTPUT_DIR, f"issue_{number}_{owner}_{repo}_{timestamp}.json"
-    )
     output_data = {
         "issue": {
-            "number": number,
+            "number": issue_number,
             "title": issue_title,
-            "url": detail.get("html_url", ""),
+            "url": issue.get("html_url", ""),
             "repository": full_name,
         },
         "bounty_info": bounty,
