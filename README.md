@@ -1,4 +1,4 @@
-﻿# GitHub Bounty Hunter
+# GitHub Bounty Hunter
 
 Automated tool that searches GitHub for issues with monetary bounties, analyzes them using OpenAI, generates fix code, and submits Pull Requests to earn rewards.
 
@@ -12,7 +12,7 @@ Automated tool that searches GitHub for issues with monetary bounties, analyzes 
 
 ## Quick Start
 
-`ash
+```bash
 # Set credentials
 export GITHUB_TOKEN="ghp_xxx"
 export OPENAI_API_KEY="sk-xxx"
@@ -31,12 +31,12 @@ python github_bounty_hunter.py --issue https://github.com/owner/repo/issues/123
 
 # Filter by minimum bounty
 python github_bounty_hunter.py --min-bounty 50
-`
+```
 
 ## Requirements
 
 - Python 3.9+
-- GitHub Personal Access Token (with epo and ead:user scopes)
+- GitHub Personal Access Token (with `repo` and `read:user` scopes)
 - OpenAI API Key
 
 ## ⚠️ Important Warning
