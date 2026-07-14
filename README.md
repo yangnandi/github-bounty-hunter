@@ -18,7 +18,7 @@ export GITHUB_TOKEN="ghp_xxx"
 export OPENAI_API_KEY="sk-xxx"
 
 # Install dependencies
-pip install requests openai
+pip install -r requirements.txt
 
 # Dry-run (safe, no PRs created)
 python github_bounty_hunter.py --dry-run --limit 3
@@ -49,4 +49,4 @@ Automated PR submissions may be perceived as spam by repository maintainers. Alw
 
 ## License
 
-MIT
+MIT - see [LICENSE](LICENSE) file for details.
