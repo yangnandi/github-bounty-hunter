@@ -36,8 +36,8 @@ python github_bounty_hunter.py --min-bounty 50
 ## Requirements
 
 - Python 3.9+
-- GitHub Personal Access Token (with `repo` and `read:user` scopes)
-- OpenAI API Key
+- GitHub Personal Access Token ([获取 →](https://github.com/settings/tokens))，需要 `repo` 和 `read:user` 权限
+- OpenAI API Key ([获取 →](https://platform.openai.com/api-keys))
 
 ## ⚠️ Important Warning
 
