@@ -1,6 +1,14 @@
-﻿outputs/
+outputs/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 .env
+.venv/
+venv/
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
