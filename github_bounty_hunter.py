@@ -318,9 +318,7 @@ def search_bounty_issues(
         if extra_query:
             full_query += f"+{extra_query}"
 
-        url = f"{GITHUB_API_BASE}/search/issues?q={full_query}&sort=created&order=desc&per_page=min(limit,10)"
-        # Replace per_page parameter
-        url = f"{GITHUB_API_BASE}/search/issues?q={full_query}&sort=created&order=desc&per_page=10"
+        url = f"{GITHUB_API_BASE}/search/issues?q={full_query}&sort=created&order=desc&per_page={min(limit, 10)}"
 
         try:
             resp = gh.get(url)
